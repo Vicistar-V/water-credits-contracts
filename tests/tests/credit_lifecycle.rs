@@ -276,12 +276,16 @@ fn test_supply_conservation_invariant_mint_transfer_retire_burn() {
     assert_eq!(token_client.balance(&farmer), 3_000);
     assert_eq!(token_client.total_burned(), 500);
     assert_eq!(token_client.total_retired(), 800); // unchanged
-    // total_supply = 5000 - 800 - 500 = 3700
+                                                   // total_supply = 5000 - 800 - 500 = 3700
     assert_eq!(token_client.total_supply(), 3_700);
     assert_invariant(5_000);
 
     // Burn is NOT recorded in the retirement registry
-    assert_eq!(registry_client.total_retired(), 800, "registry must not count admin burns");
+    assert_eq!(
+        registry_client.total_retired(),
+        800,
+        "registry must not count admin burns"
+    );
 
     // ── Step 5: second burn — ensure accumulator adds correctly ──────────
     token_client.burn(&admin, &farmer, &200);

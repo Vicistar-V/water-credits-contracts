@@ -387,9 +387,7 @@ impl CreditToken {
         save_balance(&e, &from, balance - amount);
         save_total_supply(&e, total - amount);
 
-        let new_total_burned = read_total_burned(&e)
-            .checked_add(amount)
-            .expect("overflow");
+        let new_total_burned = read_total_burned(&e).checked_add(amount).expect("overflow");
         save_total_burned(&e, new_total_burned);
 
         e.events()
