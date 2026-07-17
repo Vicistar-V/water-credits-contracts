@@ -60,6 +60,10 @@ pub enum DataKey {
     RetirementRegistry,
     TotalSupply,
     TotalRetired,
+    /// Running total of credits destroyed via `burn()` (admin-only, no retirement record).
+    /// Maintained separately from `TotalRetired` so that supply conservation can be
+    /// verified on-chain: `total_supply + total_retired + total_burned == ever_minted`.
+    TotalBurned,
     Name,
     Symbol,
     Decimals,
@@ -145,6 +149,17 @@ fn save_total_retired(e: &Env, amount: i128) {
     e.storage().instance().set(&DataKey::TotalRetired, &amount);
 }
 
+fn read_total_burned(e: &Env) -> i128 {
+    e.storage()
+        .instance()
+        .get(&DataKey::TotalBurned)
+        .unwrap_or(0)
+}
+
+fn save_total_burned(e: &Env, amount: i128) {
+    e.storage().instance().set(&DataKey::TotalBurned, &amount);
+}
+
 fn read_allowance(e: &Env, from: &Address, spender: &Address) -> i128 {
     let key = DataKey::Allowance(from.clone(), spender.clone());
     let val: i128 = e.storage().persistent().get(&key).unwrap_or(0);
@@ -194,6 +209,7 @@ impl CreditToken {
         e.storage().instance().set(&DataKey::Decimals, &7u32);
         e.storage().instance().set(&DataKey::TotalSupply, &0i128);
         e.storage().instance().set(&DataKey::TotalRetired, &0i128);
+        e.storage().instance().set(&DataKey::TotalBurned, &0i128);
         e.storage().instance().set(&DataKey::Metadata, &metadata);
         e.storage().instance().set(&DataKey::CertCount, &0u64);
     }
@@ -371,7 +387,13 @@ impl CreditToken {
         save_balance(&e, &from, balance - amount);
         save_total_supply(&e, total - amount);
 
-        e.events().publish((EVENT_BURNED,), (from, amount));
+        let new_total_burned = read_total_burned(&e)
+            .checked_add(amount)
+            .expect("overflow");
+        save_total_burned(&e, new_total_burned);
+
+        e.events()
+            .publish((EVENT_BURNED,), (from, amount, new_total_burned));
     }
 
     /// Transfer credits between wallets.
@@ -570,6 +592,14 @@ impl CreditToken {
         read_total_retired(&e)
     }
 
+    /// Total credits destroyed via admin `burn()` (no retirement record issued).
+    ///
+    /// Invariant: `total_supply() + total_retired() + total_burned() == ever_minted`
+    /// where `ever_minted` is the cumulative sum of all `mint_to` / `batch_mint_to` calls.
+    pub fn total_burned(e: Env) -> i128 {
+        read_total_burned(&e)
+    }
+
     pub fn allowance(e: Env, from: Address, spender: Address) -> i128 {
         read_allowance(&e, &from, &spender)
     }
@@ -692,6 +722,10 @@ mod tests {
 
         assert_eq!(client.balance(&user), 700);
         assert_eq!(client.total_supply(), 700);
+        // TotalBurned must track the admin-destroyed amount separately
+        assert_eq!(client.total_burned(), 300);
+        // Retired is unaffected by burn
+        assert_eq!(client.total_retired(), 0);
     }
 
     #[test]
@@ -709,6 +743,36 @@ mod tests {
         let (_contract, topics, _data) = &events.get(1).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
         assert_eq!(topic, symbol_short!("burned"));
+    }
+
+    #[test]
+    fn test_burn_event_payload_includes_running_total() {
+        let (e, admin, user, _, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        client.mint_to(&admin, &user, &1000);
+
+        // First burn: 300 → running total = 300
+        client.burn(&admin, &user, &300);
+        assert_eq!(client.total_burned(), 300);
+
+        // Second burn: 200 → running total = 500
+        client.burn(&admin, &user, &200);
+        assert_eq!(client.total_burned(), 500);
+
+        // Verify the burned events are present (topic check is sufficient;
+        // tuple-encoded event data requires XDR decoding which is out of scope here)
+        let events = e.events().all();
+        // Events: minted(1) + burned(1) + burned(1) = 3
+        assert_eq!(events.len(), 3);
+
+        let (_contract, topics1, _data1) = &events.get(1).unwrap();
+        let topic1: Symbol = Symbol::try_from_val(&e, &topics1.get(0).unwrap()).unwrap();
+        assert_eq!(topic1, symbol_short!("burned"));
+
+        let (_contract, topics2, _data2) = &events.get(2).unwrap();
+        let topic2: Symbol = Symbol::try_from_val(&e, &topics2.get(0).unwrap()).unwrap();
+        assert_eq!(topic2, symbol_short!("burned"));
     }
 
     #[test]

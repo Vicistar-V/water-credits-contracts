@@ -43,8 +43,9 @@ the factory. Credits are transferable and retirable.
 | `pause(admin)` | admin | Halt all mutable operations |
 | `unpause(admin)` | admin | Resume operations |
 | `balance(addr)` | — | Query balance |
-| `total_supply()` | — | Total credits minted minus burned |
+| `total_supply()` | — | Current circulating credits: ever minted minus burned and retired |
 | `total_retired()` | — | Total credits permanently retired |
+| `total_burned()` | — | Total credits destroyed via admin `burn()` (no retirement record) |
 | `max_supply()` | — | Current supply ceiling |
 | `paused()` | — | Whether the contract is paused |
 | `allowance(from, spender)` | — | Current approved amount |
@@ -279,8 +280,9 @@ approval threshold.
 | `Admin` | `Address` | Contract admin |
 | `Minter` | `Address` | Optional minting delegate |
 | `RetirementRegistry` | `Address` | Optional linked registry |
-| `TotalSupply` | `i128` | Ever minted minus burned |
+| `TotalSupply` | `i128` | Current circulating supply: ever minted minus burned and retired |
 | `TotalRetired` | `i128` | Ever retired |
+| `TotalBurned` | `i128` | Ever burned via admin `burn()` (initialized to 0) |
 | `MaxSupply` | `i128` | 0 = uncapped |
 | `Paused` | `bool` | Emergency halt flag |
 | `Name` / `Symbol` / `Decimals` | string/u32 | Token metadata |
@@ -326,7 +328,11 @@ approval threshold.
 
 The following properties must hold at all times:
 
-1. **Supply conservation**: `total_supply + total_retired == sum(balances) + sum(burned_via_admin)`
+1. **Supply conservation**: `total_supply + total_retired + total_burned == ever_minted`
+   where `ever_minted` is the cumulative sum of all `mint_to` / `batch_mint_to` calls,
+   `total_retired` counts credits destroyed via `retire()` (retirement record issued),
+   and `total_burned` counts credits destroyed via admin `burn()` (no retirement record).
+   Equivalently: `total_supply == ever_minted - total_retired - total_burned`.
 2. **No over-mint**: `total_supply <= max_supply` (when max_supply > 0)
 3. **Nonce monotonicity**: `OracleNonce[project_id, oracle]` never decreases
 4. **Window finality**: A finalized window's `finalized = true` is never reverted
@@ -351,6 +357,7 @@ The following properties must hold at all times:
 | `minted` | `credit_token` | `(to, amount)` | Per mint (including batch) |
 | `xfer` | `credit_token` | `(from, to, amount)` | Transfer |
 | `retired` | `credit_token` | `(holder, amount, certificate)` | Retire |
+| `burned` | `credit_token` | `(from, amount, total_burned)` | Admin burn; `total_burned` is the running accumulator after this operation |
 | `proj_reg` | `credit_factory` | `(project_id,)` | Project registered |
 | `rdng_vrfy` | `verification_oracle` | `(project_id, result)` | Window finalized |
 | `orc_stk` | `verification_oracle` | `(oracle, amount)` | Oracle stakes tokens |
