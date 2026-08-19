@@ -30,6 +30,7 @@ const EVENT_UNPAUSED: Symbol = symbol_short!("unpaused");
 const EVENT_INITIALIZED: Symbol = symbol_short!("init");
 const EVENT_APPROVED: Symbol = symbol_short!("approved");
 const EVENT_ADMIN_TRANSFERRED: Symbol = symbol_short!("adm_xfer");
+const EVENT_ADMIN_PROPOSED: Symbol = symbol_short!("adm_prop");
 
 // ── Data Types ──
 
@@ -60,6 +61,8 @@ pub enum DataKey {
     Allowance(Address, Address),
     AllowanceExpiration(Address, Address),
     Admin,
+    PendingAdmin,
+    PendingAdminActiveAfter,
     Minter,
     RetirementRegistry,
     TotalSupply,
@@ -224,16 +227,80 @@ impl CreditToken {
     }
 
     /// Transfer contract admin rights to a new address.
+    /// This is a legacy alias for `propose_admin` with a zero timelock.
+    /// The new admin must still call `accept_admin`.
     pub fn set_admin(e: Env, admin: Address, new_admin: Address) {
+        Self::propose_admin(e, admin, new_admin, 0);
+    }
+
+    /// Propose a new admin with a timelock delay in seconds (default should be 86400 for 1 day).
+    pub fn propose_admin(e: Env, admin: Address, new_admin: Address, delay_secs: u64) {
         admin.require_auth();
         let stored: Address = read_admin(&e);
         if admin != stored {
             panic!("unauthorized");
         }
-        e.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        let active_after = e.ledger().timestamp() + delay_secs;
+        e.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        e.storage()
+            .instance()
+            .set(&DataKey::PendingAdminActiveAfter, &active_after);
 
         e.events()
-            .publish((EVENT_ADMIN_TRANSFERRED,), (stored, new_admin));
+            .publish((EVENT_ADMIN_PROPOSED,), (admin, new_admin, delay_secs));
+    }
+
+    /// Accept the admin role after the timelock has expired.
+    pub fn accept_admin(e: Env, new_admin: Address) {
+        new_admin.require_auth();
+
+        let pending_admin: Option<Address> = e.storage().instance().get(&DataKey::PendingAdmin);
+        if let Some(pending) = pending_admin {
+            if pending != new_admin {
+                panic!("unauthorized");
+            }
+        } else {
+            panic!("no pending admin");
+        }
+
+        let active_after: Option<u64> = e
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdminActiveAfter);
+        if let Some(time) = active_after {
+            if e.ledger().timestamp() < time {
+                panic!("timelock not expired");
+            }
+        } else {
+            panic!("no pending admin");
+        }
+
+        let old_admin = read_admin(&e);
+        e.storage().instance().set(&DataKey::Admin, &new_admin);
+        e.storage().instance().remove(&DataKey::PendingAdmin);
+        e.storage()
+            .instance()
+            .remove(&DataKey::PendingAdminActiveAfter);
+
+        e.events()
+            .publish((EVENT_ADMIN_TRANSFERRED,), (old_admin, new_admin));
+    }
+
+    /// Cancel a pending admin proposal.
+    pub fn cancel_admin_proposal(e: Env, admin: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+
+        e.storage().instance().remove(&DataKey::PendingAdmin);
+        e.storage()
+            .instance()
+            .remove(&DataKey::PendingAdminActiveAfter);
     }
 
     /// Designate the address allowed to mint credits (typically the verification oracle).
@@ -1118,6 +1185,7 @@ mod tests {
         e.mock_all_auths();
 
         client.set_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
         client.mint_to(&new_admin, &new_admin, &200);
         assert_eq!(client.balance(&new_admin), 200);
     }
@@ -1155,15 +1223,17 @@ mod tests {
         client.set_admin(&admin, &new_admin);
 
         let events = e.events().all();
-        // initialize(1) + set_admin(1) = 2
+        // initialize(1) + set_admin / propose_admin(1) = 2
         assert_eq!(events.len(), 2);
         let (_contract, topics, data) = &events.get(1).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
-        assert_eq!(topic, symbol_short!("adm_xfer"));
+        assert_eq!(topic, symbol_short!("adm_prop"));
 
-        let (ev_old_admin, ev_new_admin) = <(Address, Address)>::try_from_val(&e, data).unwrap();
+        let (ev_old_admin, ev_new_admin, ev_delay) =
+            <(Address, Address, u64)>::try_from_val(&e, data).unwrap();
         assert_eq!(ev_old_admin, admin);
         assert_eq!(ev_new_admin, new_admin);
+        assert_eq!(ev_delay, 0);
     }
 
     #[test]
@@ -1403,5 +1473,65 @@ mod tests {
             }
         }
         assert!(found);
+    }
+
+    #[test]
+    fn test_admin_rotation_happy_path() {
+        let (e, admin, _user1, _user2, _project_id, client) = setup();
+        let new_admin = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.propose_admin(&admin, &new_admin, &86400);
+
+        // Advance ledger by > 1 day
+        let mut info = e.ledger().get();
+        info.timestamp += 86401;
+        e.ledger().set(info);
+
+        client.accept_admin(&new_admin);
+
+        // Old admin can't mint anymore
+        let result = client.try_mint_to(&admin, &new_admin, &100);
+        assert!(result.is_err());
+
+        // New admin can mint
+        client.mint_to(&new_admin, &new_admin, &200);
+        assert_eq!(client.balance(&new_admin), 200);
+    }
+
+    #[test]
+    fn test_admin_rotation_accept_before_delay_panics() {
+        let (e, admin, _user1, _user2, _project_id, client) = setup();
+        let new_admin = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.propose_admin(&admin, &new_admin, &86400);
+
+        // Advance ledger by < 1 day
+        let mut info = e.ledger().get();
+        info.timestamp += 40000;
+        e.ledger().set(info);
+
+        let result = client.try_accept_admin(&new_admin);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_admin_rotation_cancel_clears_pending() {
+        let (e, admin, _user1, _user2, _project_id, client) = setup();
+        let new_admin = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.propose_admin(&admin, &new_admin, &86400);
+        client.cancel_admin_proposal(&admin);
+
+        // Advance ledger by > 1 day
+        let mut info = e.ledger().get();
+        info.timestamp += 86401;
+        e.ledger().set(info);
+
+        // new_admin cannot accept since it was cancelled
+        let result = client.try_accept_admin(&new_admin);
+        assert!(result.is_err());
     }
 }
